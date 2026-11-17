@@ -40,7 +40,6 @@ export const TX = {
 } as const;
 
 export const LARGE_TX_ROW_COUNT = 20000;
-export const LARGE_TX_PREPARE_BATCH = 200;
 
 let rowSeq = 0;
 function row(

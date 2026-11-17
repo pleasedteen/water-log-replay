@@ -429,11 +429,38 @@ export class SyncStore {
     }
   }
 
+  /** Cumulative number of rows of one transaction already staged (durable watermark). */
+  stagedRowCount(txId: string): number {
+    return (this.stmts.countStaged.get(txId) as { c: number }).c;
+  }
+
+  /** Durable per-transaction row used by tests/probes to observe partial prepare. */
+  getTxState(txId: string): {
+    tx_id: string;
+    tx_version: string;
+    status: 'open' | 'prepared' | 'published';
+    expected_count: number | null;
+    received_count: number;
+    prepared_count: number;
+  } | null {
+    const row = this.stmts.getTx.get(txId) as
+      | {
+          tx_id: string;
+          tx_version: string;
+          status: 'open' | 'prepared' | 'published';
+          expected_count: number | null;
+          received_count: number;
+          prepared_count: number;
+        }
+      | undefined;
+    return row ?? null;
+  }
+
   /**
    * Eligible = all row events received AND commit seen with matching count AND
    * schema interpretable (v2 rows require schema v2 to be applied).
    */
-  private nextPrepareCandidate(): { tx_id: string; schema_version: number } | null {
+  nextPrepareCandidate(): { tx_id: string; schema_version: number } | null {
     const rows = this.stmts.listOpen.all() as Array<{
       tx_id: string;
       schema_version: number;
@@ -447,6 +474,30 @@ export class SyncStore {
       return { tx_id: r.tx_id, schema_version: r.schema_version };
     }
     return null;
+  }
+
+  /**
+   * Publish the oldest fully-prepared transaction in one short commit.
+   * Returns the published txId, or null when nothing is prepared. Publishing
+   * one transaction at a time lets the engine honor pause boundaries between
+   * durable publish units instead of flushing every prepared tx in one go.
+   */
+  publishOne(): string | null {
+    const prepared = this.stmts.listPrepared.get() as
+      | { tx_id: string; tx_version: string }
+      | undefined;
+    if (!prepared) return null;
+    const now = new Date().toISOString();
+    this.db.exec('begin immediate');
+    try {
+      this.stmts.insertPublished.run(prepared.tx_id, prepared.tx_version, now);
+      this.stmts.markPublished.run(now, prepared.tx_id);
+      this.db.exec('commit');
+    } catch (err) {
+      this.db.exec('rollback');
+      throw err;
+    }
+    return prepared.tx_id;
   }
 
   /** Publish all prepared transactions; each publish is one short tx. */

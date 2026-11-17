@@ -6,14 +6,41 @@
  * events) at a time and prepare batches are capped at MAX_PREPARE_ROWS rows.
  * Neither the whole log nor the 20k-row transaction is ever materialized in
  * memory at once.
+ *
+ * Pause semantics
+ * ---------------
+ * A pause is honored at DURABLE-UNIT boundaries only. A durable unit is one
+ * of:
+ *   - a page persistence transaction (persistPage)
+ *   - one <=200-row prepare batch commit (prepareBatch)
+ *   - one short per-transaction publish commit (publishOne)
+ *
+ * Once pause has been requested, the unit currently in flight is allowed to
+ * finish and commit; the engine then starts no further receive, prepare or
+ * publish unit. Prepared-but-unpublished and partially-prepared state stays
+ * on disk and is resumed by the next start (or by a fresh process reopening
+ * the same SQLite file). Pause never rolls staged work back and never
+ * re-fetches already-persisted data.
+ *
+ * start()/pause() calls are serialized through a control promise chain so
+ * concurrent requests take effect one at a time in arrival order; there can
+ * never be two loops and a pause can never return before the loop has
+ * actually stopped.
  */
 
 import { SyncStore, MAX_PREPARE_ROWS } from './store';
 import type { DeliveredEvent, FaultPoint, LogEnvelope } from '../shared/protocol';
-import { LARGE_TX_PREPARE_BATCH } from '../fixtures/fixtures';
 
 /** Persist this many pages before the after_receive_persist fault exits. */
 const RECEIVE_FAULT_AFTER_PAGES = 2;
+
+/** Configuration of the configurable mid-prepare fault point. */
+export interface MidPrepareFaultConfig {
+  /** only this transaction triggers the fault */
+  txId: string;
+  /** exit once this many rows of the target tx are cumulatively staged */
+  afterRows: number;
+}
 
 export interface EngineOptions {
   sourceBaseUrl: string;
@@ -28,18 +55,28 @@ export interface EngineOptions {
    */
   prepareBatchDelayMs: number;
   fault?: FaultPoint | null;
+  /** target transaction / cumulative staged rows for mid_prepare_big_tx */
+  midPrepare?: MidPrepareFaultConfig | null;
   /** structured log sink (injectable for tests). */
   log?: (line: Record<string, unknown>) => void;
 }
 
+type PrepareBatchResult = ReturnType<SyncStore['prepareBatch']>;
+
 export class SyncEngine {
   private store: SyncStore;
-  private opts: Required<Omit<EngineOptions, 'fault'>> & { fault: FaultPoint | null };
+  private opts: Required<Omit<EngineOptions, 'fault' | 'midPrepare'>> & {
+    fault: FaultPoint | null;
+    midPrepare: MidPrepareFaultConfig | null;
+  };
   private running = false;
   private paused = true;
   private loopPromise: Promise<void> | null = null;
   private wakeWaiter: (() => void) | null = null;
   private faultConsumed = false;
+  /** Serializes concurrent start/pause requests in arrival order. */
+  private controlChain: Promise<unknown> = Promise.resolve();
+  private pagesPersisted = 0;
 
   constructor(store: SyncStore, options: EngineOptions) {
     this.store = store;
@@ -50,6 +87,7 @@ export class SyncEngine {
       prepareBatchDelayMs: options.prepareBatchDelayMs,
       sourceBaseUrl: options.sourceBaseUrl,
       fault: options.fault ?? null,
+      midPrepare: options.midPrepare ?? null,
       log: options.log ?? ((line) => console.log(JSON.stringify(line))),
     };
   }
@@ -61,22 +99,46 @@ export class SyncEngine {
     return this.paused;
   }
 
-  start(): boolean {
-    if (this.running) return false; // duplicate start never creates a second loop
-    this.running = true;
-    this.paused = false;
-    this.loopPromise = this.loop().catch((err) => {
-      this.opts.log({ svc: 'sync', level: 'error', event: 'loop-terminated', error: String(err) });
+  /**
+   * Start the pull loop. Idempotent: returns false when a loop is already
+   * running and never creates a second one. Concurrent start/pause calls are
+   * serialized, so a start arriving while a pause is still settling waits for
+   * that pause and then starts exactly one fresh loop.
+   */
+  start(): Promise<boolean> {
+    const step = this.controlChain.then(() => {
+      if (this.running) return false; // duplicate start never creates a second loop
+      this.running = true;
+      this.paused = false;
+      this.loopPromise = this.loop().catch((err) => {
+        this.opts.log({ svc: 'sync', level: 'error', event: 'loop-terminated', error: String(err) });
+      });
+      this.opts.log({ svc: 'sync', event: 'sync-start', receivedOffset: this.store.getReceivedOffset() });
+      return true;
     });
-    return true;
+    // Keep the chain alive even if a caller's awaited promise rejects.
+    this.controlChain = step.catch(() => undefined);
+    return step;
   }
 
-  /** Stop pulling after the current durable batch / prepare / publish step. */
-  async pause(): Promise<void> {
-    this.paused = true;
-    if (this.wakeWaiter) this.wakeWaiter(); // abort any backoff sleep immediately
-    if (this.loopPromise) await this.loopPromise;
-    this.running = false;
+  /**
+   * Request a pause and wait until the loop has stopped at a durable-unit
+   * boundary. When this settles, running=false and every durable position
+   * (received offset, prepare watermarks, published set) is stable. Multiple
+   * concurrent pauses all wait for the same stop; none returns early.
+   */
+  pause(): Promise<void> {
+    const step = this.controlChain.then(async () => {
+      this.paused = true;
+      if (this.wakeWaiter) this.wakeWaiter(); // abort any backoff/sleep immediately
+      const loop = this.loopPromise;
+      this.loopPromise = null;
+      if (loop) await loop; // resolve only after the loop actually stopped
+      this.running = false;
+      this.opts.log({ svc: 'sync', event: 'sync-paused', receivedOffset: this.store.getReceivedOffset() });
+    });
+    this.controlChain = step.catch(() => undefined);
+    return step;
   }
 
   private async loop(): Promise<void> {
@@ -97,6 +159,11 @@ export class SyncEngine {
         continue;
       }
 
+      // A pause requested while the fetch was in flight: the fetch is not a
+      // durable unit, so stop before persisting anything. The same events are
+      // re-fetched from the unchanged durable offset after resume.
+      if (this.paused) break;
+
       const entries = page.events.map((event) => ({
         // Overlap pages repeat events whose offset is <= the prior tail;
         // the simulator annotates each event with its real transport offset.
@@ -104,6 +171,7 @@ export class SyncEngine {
         event,
       }));
       if (entries.length > 0) {
+        // One durable unit: the whole page commits atomically with the offset.
         this.store.persistPage(entries, page.nextOffset);
         this.store.setLastError(null);
         this.opts.log({
@@ -116,13 +184,19 @@ export class SyncEngine {
         this.maybeReceiveFault();
       }
 
+      // Boundary: once the in-flight persist unit is durable, a pending pause
+      // stops the loop before schema work / prepare / publish.
+      if (this.paused) break;
+
       // Schema declarations may arrive late; apply before evaluating candidates.
       const applied = this.store.applyDueSchemaEvents();
       for (const a of applied) this.opts.log({ svc: 'sync', event: 'schema-applied', schemaVersion: a.event.schemaVersion });
 
       // Prepare + publish whatever is currently completable, in small units so
-      // reads stay responsive and memory stays bounded.
+      // reads stay responsive and memory stays bounded. drainPipeline itself
+      // honors pause at every durable-unit boundary.
       await this.drainPipeline();
+      if (this.paused) break;
 
       if (!page.hasMore && entries.length === 0) {
         // Caught up. Sleep briefly but remain interruptible by pause.
@@ -133,17 +207,17 @@ export class SyncEngine {
   }
 
   private async drainPipeline(): Promise<void> {
-    // Prepare in <=200-row batches while eligible work exists. A large tx
-    // spans many batches; when its current batch is exhausted we keep looping
-    // so other fully-received transactions can be prepared/published instead
-    // of stalling behind the in-progress one.
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const status = this.store.getStatus(this.running);
-      if (status.openTransactions === 0) break;
-      const faultAfter =
-        this.opts.fault === 'mid_prepare_big_tx' && !this.faultConsumed ? LARGE_TX_PREPARE_BATCH : undefined;
-      const result = this.store.prepareBatch(faultAfter);
+    // ---- Phase 1: prepare in <=200-row durable batches --------------------
+    // A large tx spans many batches; when its current batch is exhausted we
+    // keep looping so other fully-received transactions can be prepared
+    // instead of stalling behind the in-progress one. The pause flag is
+    // re-checked between every batch: no new batch starts once pause is set,
+    // and a partially prepared large tx stays 'open' on disk for resume.
+    while (!this.paused) {
+      const candidate = this.store.nextPrepareCandidate();
+      if (!candidate) break;
+      const cut = this.midPrepareCut(candidate.tx_id);
+      const result: PrepareBatchResult = this.store.prepareBatch(cut ?? undefined);
       if (!result.txId) break;
       this.opts.log({
         svc: 'sync',
@@ -152,40 +226,71 @@ export class SyncEngine {
         rows: result.rows,
         batchCap: MAX_PREPARE_ROWS,
       });
-      if (this.opts.fault === 'mid_prepare_big_tx' && faultAfter !== undefined && result.rows >= faultAfter) {
-        this.fireFault('mid_prepare_big_tx', { txId: result.txId });
-        return;
-      }
+      if (this.consumeMidPrepareFault(candidate.tx_id, result)) return; // process exits (42)
       // Yield between batches: keeps the read API responsive and, when
-      // configured, widens the prepare window for test probes.
+      // configured, widens the prepare window for test probes. The sleep is
+      // interruptible, so pause also cuts this wait short.
       if (this.opts.prepareBatchDelayMs > 0) await this.interruptibleSleep(this.opts.prepareBatchDelayMs);
       else await new Promise((r) => setImmediate(r));
-      // If this batch did not finish a large tx, try the next candidate; when
-      // no other candidate exists prepareBatch returns null and we exit the
-      // loop until more rows are received on subsequent pages.
-      if (!result.finished) continue;
     }
 
-    // Publish every fully-prepared transaction in a short commit per tx.
-    if (this.store.hasPrepared()) {
+    // ---- Phase 2: publish, one short commit per prepared tx ---------------
+    // Boundary before every publish: after pause, already-prepared
+    // transactions are NOT published and remain staged in the database.
+    while (!this.paused && this.store.hasPrepared()) {
       if (this.opts.fault === 'before_publish_commit' && !this.faultConsumed) {
-        // Fire as soon as the first transaction is fully staged, so the
-        // restart must reconcile prepared-but-unpublished state itself.
+        // Fire as soon as a transaction is fully staged, so the restart must
+        // reconcile prepared-but-unpublished state itself.
         this.fireFault('before_publish_commit', { prepared: this.store.preparedTxIds().length });
         return;
       }
-      const ids = this.store.publishReady();
-      for (const txId of ids) this.opts.log({ svc: 'sync', event: 'tx-published', txId, via: 'short-commit' });
+      const txId = this.store.publishOne();
+      if (txId === null) break;
+      this.opts.log({ svc: 'sync', event: 'tx-published', txId, via: 'short-commit' });
       if (this.opts.fault === 'after_publish_commit' && !this.faultConsumed) {
         // Fire after the first publish commit; the restart proves the already
         // committed publish is not duplicated while remaining txs still flow.
-        this.fireFault('after_publish_commit', { published: ids.length });
+        this.fireFault('after_publish_commit', { published: 1 });
         return;
       }
     }
   }
 
-  private pagesPersisted = 0;
+  /**
+   * Compute the early-commit row count for the current batch so the
+   * configurable mid-prepare fault lands exactly on the configured cumulative
+   * staged-row count. Returns null when the fault must not fire here.
+   */
+  private midPrepareCut(txId: string): number | null {
+    if (this.opts.fault !== 'mid_prepare_big_tx' || this.faultConsumed) return null;
+    const cfg = this.opts.midPrepare;
+    if (!cfg || txId !== cfg.txId) return null;
+    const already = this.store.stagedRowCount(txId);
+    if (already >= cfg.afterRows) return null; // defensive: should have fired earlier
+    const remaining = cfg.afterRows - already;
+    return remaining < MAX_PREPARE_ROWS ? remaining : MAX_PREPARE_ROWS;
+  }
+
+  /**
+   * Fire the mid-prepare fault once the target transaction reaches the
+   * configured cumulative prepare row count. Returns true when the process
+   * exit has been scheduled. Already-staged batches remain durable.
+   */
+  private consumeMidPrepareFault(txId: string, result: PrepareBatchResult): boolean {
+    if (this.opts.fault !== 'mid_prepare_big_tx' || this.faultConsumed) return false;
+    const cfg = this.opts.midPrepare;
+    if (!cfg || txId !== cfg.txId) return false;
+    const cumulative = this.store.stagedRowCount(txId);
+    if (cumulative < cfg.afterRows) return false;
+    this.fireFault('mid_prepare_big_tx', {
+      txId,
+      targetTxId: cfg.txId,
+      targetRows: cfg.afterRows,
+      cumulativePreparedRows: cumulative,
+      batchRows: result.rows,
+    });
+    return true;
+  }
 
   /**
    * The receive fault fires only after several pages are durable, proving the
@@ -211,14 +316,17 @@ export class SyncEngine {
 
   private async interruptibleSleep(ms: number): Promise<void> {
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return; // a pause wake and the timer can never double-resolve
+        settled = true;
         this.wakeWaiter = null;
         resolve();
-      }, ms);
+      };
+      const timer = setTimeout(finish, ms);
       this.wakeWaiter = () => {
         clearTimeout(timer);
-        this.wakeWaiter = null;
-        resolve();
+        finish();
       };
     });
   }

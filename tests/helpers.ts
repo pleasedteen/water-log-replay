@@ -72,6 +72,20 @@ export async function startSource(opts: { overlap?: boolean; failEvery?: number 
   return { source, port, log, stop };
 }
 
+export interface SyncDiagnostics {
+  meta: { received_offset: string; schema_version: number; retry_count: number; last_error: string | null };
+  transactions: Array<{
+    tx_id: string;
+    tx_version: string;
+    status: 'open' | 'prepared' | 'published';
+    expected_count: number | null;
+    received_count: number;
+    prepared_count: number;
+  }>;
+  stagedRows: number;
+  publishedRows: { c: number };
+}
+
 export async function startSync(opts: {
   sourcePort: number;
   dbFile: string;
@@ -79,6 +93,11 @@ export async function startSync(opts: {
   autostart?: boolean;
   pageLimit?: number;
   prepareDelayMs?: number;
+  /** mid_prepare_big_tx target transaction (SYNC_MID_PREPARE_TX) */
+  midPrepareTx?: string;
+  /** mid_prepare_big_tx cumulative staged rows (SYNC_MID_PREPARE_ROWS) */
+  midPrepareRows?: number;
+  backoffMs?: number;
 }): Promise<{ sync: ChildProcess; port: number; log: string[]; stop: () => Promise<void> }> {
   const port = await getFreePort();
   const log: string[] = [];
@@ -93,7 +112,9 @@ export async function startSync(opts: {
       SYNC_AUTOSTART: opts.autostart === false ? '' : '1',
       SYNC_PAGE_LIMIT: String(opts.pageLimit ?? 1000),
       SYNC_PREPARE_DELAY_MS: String(opts.prepareDelayMs ?? 0),
-      SYNC_BACKOFF_MS: '25',
+      SYNC_MID_PREPARE_TX: opts.midPrepareTx ?? '',
+      SYNC_MID_PREPARE_ROWS: opts.midPrepareRows !== undefined ? String(opts.midPrepareRows) : '',
+      SYNC_BACKOFF_MS: String(opts.backoffMs ?? 25),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -199,6 +220,47 @@ export async function waitForStatus(
     await sleep(15);
   }
   throw new Error(`status predicate not met; last=${JSON.stringify(last)}`);
+}
+
+/** Fetch the structured /diagnostics snapshot. */
+export async function getDiagnostics(port: number): Promise<SyncDiagnostics> {
+  const { body } = await httpJson<SyncDiagnostics>(`http://127.0.0.1:${port}/diagnostics`);
+  return body;
+}
+
+/** Look up one transaction row in /diagnostics. */
+export async function getTxDiagnostic(
+  port: number,
+  txId: string,
+): Promise<SyncDiagnostics['transactions'][number] | null> {
+  const d = await getDiagnostics(port);
+  return d.transactions.find((t) => t.tx_id === txId) ?? null;
+}
+
+/**
+ * Poll /diagnostics until a transaction's durable prepare watermark enters the
+ * given inclusive range (and, when requested, it is still not published).
+ * Used instead of fixed startup sleeps to time pause requests precisely.
+ */
+export async function waitForPreparedRows(
+  port: number,
+  txId: string,
+  range: { min?: number; max?: number; notPublished?: boolean },
+  timeoutMs = 30000,
+): Promise<SyncDiagnostics['transactions'][number]> {
+  const deadline = Date.now() + timeoutMs;
+  let last: SyncDiagnostics['transactions'][number] | null = null;
+  while (Date.now() < deadline) {
+    last = await getTxDiagnostic(port, txId);
+    if (last) {
+      const minOk = range.min === undefined || last.prepared_count >= range.min;
+      const maxOk = range.max === undefined || last.prepared_count <= range.max;
+      const pubOk = !range.notPublished || last.status !== 'published';
+      if (minOk && maxOk && pubOk) return last;
+    }
+    await sleep(6);
+  }
+  throw new Error(`tx ${txId} watermark never entered range ${JSON.stringify(range)}; last=${JSON.stringify(last)}`);
 }
 
 /** Page through the entire readings list (keyset pagination). */

@@ -32,10 +32,10 @@ curl http://127.0.0.1:8081/status                 # 查看同步状态
 curl "http://127.0.0.1:8081/readings?limit=5"    # 分页列表（按 recordId 排序）
 curl http://127.0.0.1:8081/readings/R-0003        # 单条；删除或未可见返回 404
 curl http://127.0.0.1:8081/diagnostics            # 流水线诊断
-curl -X POST http://127.0.0.1:8081/sync/pause     # 当前持久化批次结束后停止拉取
+curl -X POST http://127.0.0.1:8081/sync/pause     # 在持久化批次边界停止（不发布已 prepared 事务）
 ```
 
-运行测试（安装依赖时间不计入；当前约 50–55 秒，预算 80 秒）：
+运行测试（安装依赖时间不计入；当前约 60–70 秒，预算 80 秒，测试文件并行执行）：
 
 ```bash
 npm test
@@ -59,10 +59,12 @@ src/
   sync/main.ts            同步进程入口
 tests/
   helpers.ts              子进程/真实 SQLite 文件/端口/轮询工具
+  fault-utils.ts          故障/暂停测试共享：独立重开 SQLite、收敛与参考核对
   reference-replayer.ts   独立参考回放器（不与同步器共用任何合并实现）
   store-unit.test.ts      真实 SQLite 文件上的迁移、乱序、批次、持久性测试
   happy-path.test.ts      全量回放 + 参考核对 + 分页/404/重启幂等
-  fault-recovery.test.ts  四个故障点的真实崩溃-重启链、可见性、暂停、503 重试
+  fault-recovery.test.ts  四个故障点的真实崩溃-重启链、可配置累计故障位置、可见性
+  pause-control.test.ts   持久化批次边界暂停、prepared 未发布暂停、并发控制、503 退避暂停
 scripts/dev.js            npm run dev 的双进程启动器（带前缀日志）
 ```
 
@@ -283,14 +285,50 @@ schema 版本编译，不会因旧列名不存在而崩溃。
 因此即使退出发生在接收、分批准备、发布提交的任意边界，恢复都**不依赖源端恰好再送来一条
 新事件**——集成测试里大事务故障发生时全部日志已持久化，最终收敛过程源端无需再发任何东西。
 
+### 暂停与并发控制语义（持久化批次边界）
+
+暂停被接受后，引擎只允许**当前已经开始的那个持久化单元**完成并落盘，随后立即停止：
+
+- 持久化单元只有三种：一次接收页 `persistPage` 事务、一个 ≤200 行的 `prepareBatch`
+  提交、一次单事务 `publishOne` 短提交；
+- 暂停标志在每个单元之间重新检查。已经 `prepared` 但未发布的事务**不会被顺手发布**，
+  仍停在暂存区；大事务可能停在“部分准备（status=open，prepared_count 介于 0 与 20000
+  之间）”，该水位逐行持久化在 `tx_rows.staged` 上；
+- 暂停**不撤销**任何已暂存结果，也**不重新拉取**已持久化的数据。部分准备与
+  prepared-未发布两种状态都原样保留，下一次 `/sync/start` 或全新进程重开同一 SQLite
+  文件后从该水位继续；
+- 暂停期间只读 API（`/status`、`/readings`、`/diagnostics`）照常即时响应；
+- `POST /sync/pause` 的响应在循环真正停止后才返回，body 直接给出稳定快照：
+
+```json
+{
+  "paused": true,
+  "running": false,
+  "receivedOffset": "9007199254761020",
+  "openTransactions": 2,
+  "preparedTransactions": 1,
+  "publishedTransactions": 7
+}
+```
+
+`start`/`pause` 全部经过同一条控制链串行化（到达顺序执行），并发语义确定且一致：
+
+| 情形 | 语义 |
+| --- | --- |
+| 重复 start（含同时到达的两个 start） | 只有一个返回 `started:true` 并建立唯一循环，另一个 `started:false`，绝不会有两个循环 |
+| 多个同时到达的 pause | 都等待同一次停止；没有任何一个提前返回，全部在 `running=false` 后才完成，且报告相同的稳定位置 |
+| 暂停尚未完成时到达的 start | 排在该 pause 之后执行：暂停先在边界落定，start 再启动唯一一个新循环，从冻结的持久化位置继续 |
+| 对已停止的引擎再次 pause | 立即返回，状态不变 |
+| 503 退避等待中 pause | 立即唤醒并打断退避（不等待退避超时），随后在边界停止 |
+
 ---
 
 ## 同步服务 API
 
 | 方法与路径 | 行为 |
 | --- | --- |
-| `POST /sync/start` | 后台开始拉取；重复调用返回 `started:false`，不会建立第二个循环 |
-| `POST /sync/pause` | 等当前持久化批次/准备/发布步骤结束后停止；能立即打断退避等待；之后可再次 start |
+| `POST /sync/start` | 后台开始拉取；重复/并发调用至多建立一个循环，已在运行时返回 `started:false`。与 pause 串行化：暂停尚未落定时到达的 start 会等暂停完成后再启动唯一一个新循环 |
+| `POST /sync/pause` | 在**持久化单元边界**停止：只允许当前在途的接收页/准备批次/发布短事务提交完成，之后不再准备下一批，也不发布任何已 prepared 的事务；能立即打断退避等待。返回时 `running=false` 且接收位置、准备水位、发布集合全部稳定，查询接口照常可用；之后可再次 start |
 | `GET /status` | 见下方计数口径 |
 | `GET /readings?limit=&after=` | 按 `recordId` 升序的 keyset 分页，响应带当前对外 `schemaVersion` 与 `nextRecordId` |
 | `GET /readings/:recordId` | 返回 `{schemaVersion, item}`；删除后或未发布 → 404 |
@@ -338,7 +376,10 @@ schema 版本编译，不会因旧列名不存在而崩溃。
 {"svc":"sync","event":"schema-applied","schemaVersion":2}
 {"svc":"sync","event":"tx-published","txId":"TX-0010","via":"short-commit"}
 {"svc":"sync","level":"warn","event":"fetch-retry","retryInMs":25,"error":"source 503: ..."}
-{"svc":"sync","level":"fatal","event":"fault-exit","fault":"mid_prepare_big_tx","txId":"TX-0010"}
+{"svc":"sync","event":"sync-paused","receivedOffset":"9007199254761020"}
+{"svc":"sync","level":"fatal","event":"fault-exit","fault":"mid_prepare_big_tx",
+ "txId":"TX-0010","targetTxId":"TX-0010","targetRows":10000,
+ "cumulativePreparedRows":10000,"batchRows":200}
 ```
 
 准备批次之间会让出事件循环（生产环境仅一个 `setImmediate`，测试可用
@@ -378,18 +419,38 @@ schema 版本编译，不会因旧列名不存在而崩溃。
 | 故障点 | 触发时机 |
 | --- | --- |
 | `after_receive_persist` | 第 2 个接收页持久化之后 |
-| `mid_prepare_big_tx` | 大事务第一个 200 行准备批次落盘之后 |
+| `mid_prepare_big_tx` | 目标事务的**累计准备行数**达到配置值（默认自带两万行事务 `TX-0010` 的第 10000 行）的那个批次落盘之后 |
 | `before_publish_commit` | 第一个就绪事务发布提交之前 |
 | `after_publish_commit` | 第一个发布短事务提交之后 |
 
+`mid_prepare_big_tx` 的目标可配置，且按**累计**准备行数而非“第 N 个批次”定位，因此可以落在
+非 200 对齐的任意行上。触发时此前已提交的所有准备批次都保留在盘上，进程以 42 退出，
+`fault-exit` 日志写出实际累计准备数与命中的批次行数：
+
+```json
+{"svc":"sync","level":"fatal","event":"fault-exit","fault":"mid_prepare_big_tx",
+ "txId":"TX-0010","targetTxId":"TX-0010","targetRows":10000,
+ "cumulativePreparedRows":10000,"batchRows":200}
+```
+
+配置项（见下方环境变量表）：`SYNC_MID_PREPARE_TX`（目标事务 id，默认 `TX-0010`）、
+`SYNC_MID_PREPARE_ROWS`（触发的累计准备行数，默认 `10000`）。恢复验证时**关闭故障注入**
+（不设置 `SYNC_FAULT`），剩余准备与整体发布完全由已持久化状态驱动，源端不需要新增任何事件。
+
 `tests/fault-recovery.test.ts` 用**同一个 SQLite 文件**串行启动四个带不同故障的进程，每个
 都真实崩溃、下一个进程在同一文件上恢复，最后一个无故障进程收敛到最终状态，并与独立参考
-回放器逐条核对。另含：
+回放器逐条核对。暂停与并发场景在并行执行的 `tests/pause-control.test.ts`。另含：
 
-- **准备期间持续查询**：大事务准备过程中高频轮询列表，证明 BIG 记录数量只能是 0 或
-  19999，绝不会出现部分可见的中间态，且读接口全程可响应；
-- **暂停/继续/重启**：`/sync/start` 幂等、暂停后接收位置不再前进、重启后可完成；
-- **503 退避重试**：退避可被暂停立即打断，恢复后仍正确收敛。
+- **可配置故障位置**（fault-recovery）：以非批次对齐的累计行数（2500）触发，校验
+  `fault-exit` 日志与盘上水位精确等于该值；
+- **准备期间持续查询**（fault-recovery）：大事务准备过程中高频轮询列表，证明 BIG 记录数量
+  只能是 0 或 19999，绝不会出现部分可见的中间态，且读接口全程可响应；
+- **批次边界暂停**（pause-control）：先经 `/diagnostics` 确认大事务已经跨多个 200 行批次
+  准备且尚未发布再发 pause（不依赖固定睡眠）；随后独立重开同一 SQLite 文件核对水位冻结、
+  剩余准备、整体发布与独立回放；
+- **prepared 未发布时暂停**（pause-control）：暂停保留 prepared 事务、不发布，start 后再发布；
+- **并发控制**（pause-control）：重复 start、同时到达的多个 pause、暂停落定中的 start 都有确定语义；
+- **503 退避重试**（pause-control）：退避可被暂停立即打断，恢复后仍正确收敛。
 
 ### 独立参考回放器
 
@@ -400,13 +461,18 @@ schema 版本编译，不会因旧列名不存在而崩溃。
 
 ### 测试输出怎么看
 
-`npm test` 的用例命名直接体现四类验收点：
+`npm test` 的用例命名直接体现验收点，输出可分辨三类关键场景——**批次暂停**、**累计故障
+位置**与**无新增事件恢复**：
 
-- `FAULT chain ...` / `... invisible while preparing` —— **故障恢复**与大事务可见性；
+- `FAULT chain ...` / `... configurable target tx/cumulative rows ...` —— **故障恢复**、可
+  配置的累计准备行故障点（日志中的 `cumulativePreparedRows` 即实际累计位置）与大事务可见性；
+- `PAUSE: boundary freeze plus concurrency semantics ...` —— **批次边界暂停 + 并发控制**：经诊断
+  确认跨多批准备后同时发两个 pause，盘上水位停在中间、并发 pause 报告相同稳定位置、重复/
+  暂停落定中的 start 只建一个循环；重开同一 SQLite 文件核对剩余准备与整体发布（恢复不要求新源事件）；
+- `PAUSE-PREPARED ...` —— prepared 未发布时暂停，状态保留、start 后再发布；
 - `MIGRATION ...` —— **版本迁移**（物理列改名、legacy 回填、v1 积压后置处理）；
 - `HAPPY: full replay ...` —— **大事务可见性**、乱序/重复/删除/404 与参考核对；
-- `DURABILITY` / `ORDERING` / `BATCHING` / `RETRY` / `PAUSE` —— 持久化、新旧判定、200 行
-  批次、退避与暂停语义。
+- `DURABILITY` / `ORDERING` / `BATCHING` / `RETRY` —— 持久化、新旧判定、200 行批次、退避。
 
 ---
 
@@ -419,6 +485,8 @@ schema 版本编译，不会因旧列名不存在而崩溃。
 | `SYNC_DB` | data/sync.db | SQLite 文件路径（父目录自动创建） |
 | `SYNC_PAGE_LIMIT` | 1000 | 每页拉取事件数 |
 | `SYNC_FAULT` | 未设置 | 一次性故障点（见上表） |
+| `SYNC_MID_PREPARE_TX` | `TX-0010` | `mid_prepare_big_tx` 的目标事务 id |
+| `SYNC_MID_PREPARE_ROWS` | `10000` | `mid_prepare_big_tx` 触发时目标事务的累计准备行数 |
 | `SYNC_AUTOSTART` | 未设置 | 设为 `1` 时进程启动即开始同步 |
 | `SYNC_BACKOFF_MS` / `SYNC_MAX_BACKOFF_MS` | 100 / 2000 | 503 退避起点与上限（指数翻倍） |
 | `SYNC_PREPARE_DELAY_MS` | 0 | 每个准备批次后的额外让出时间（测试用） |

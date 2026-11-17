@@ -12,6 +12,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import { SyncStore } from './store';
 import { SyncEngine } from './engine';
+import type { MidPrepareFaultConfig } from './engine';
 import type { FaultPoint, ListResponse, SyncStatus } from '../shared/protocol';
 
 export interface SyncServerOptions {
@@ -20,6 +21,7 @@ export interface SyncServerOptions {
   port: number;
   pageLimit: number;
   fault: FaultPoint | null;
+  midPrepare: MidPrepareFaultConfig | null;
   log?: (line: Record<string, unknown>) => void;
 }
 
@@ -32,6 +34,7 @@ export function createSyncServer(options: SyncServerOptions) {
     maxBackoffMs: Number(process.env.SYNC_MAX_BACKOFF_MS ?? 2000),
     prepareBatchDelayMs: Number(process.env.SYNC_PREPARE_DELAY_MS ?? 0),
     fault: options.fault,
+    midPrepare: options.midPrepare,
     log: options.log,
   });
 
@@ -48,14 +51,28 @@ export function createSyncServer(options: SyncServerOptions) {
     const path = url.pathname;
 
     if (req.method === 'POST' && path === '/sync/start') {
-      const started = engine.start();
-      json(res, 200, { started, running: engine.isRunning(), receivedOffset: store.getReceivedOffset() });
+      engine
+        .start()
+        .then((started) => json(res, 200, { started, running: engine.isRunning(), receivedOffset: store.getReceivedOffset() }))
+        .catch((err) => json(res, 500, { error: String(err) }));
       return;
     }
     if (req.method === 'POST' && path === '/sync/pause') {
       engine
         .pause()
-        .then(() => json(res, 200, { paused: true, receivedOffset: store.getReceivedOffset() }))
+        .then(() => {
+          // Snapshot every durable position after the loop has actually
+          // stopped, so callers can assert stability directly from the body.
+          const status: SyncStatus = store.getStatus(engine.isRunning());
+          json(res, 200, {
+            paused: true,
+            running: status.running,
+            receivedOffset: status.receivedOffset,
+            openTransactions: status.openTransactions,
+            preparedTransactions: status.preparedTransactions,
+            publishedTransactions: status.publishedTransactions,
+          });
+        })
         .catch((err) => json(res, 500, { error: String(err) }));
       return;
     }
